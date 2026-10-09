@@ -1248,10 +1248,43 @@ def _apply_hosted_thinking_mode(
         payload["thinking"] = {"type": "enabled" if mode == "on" else "disabled"}
 
 
+# OpenRouter models that rejected a reasoning-off request with HTTP 400
+# "Reasoning is mandatory"; kept for the process lifetime.
+_OPENROUTER_LEARNED_REASONING_REQUIRED: set[str] = set()
+
+
+def _openrouter_reasoning_model_key(model: str) -> str:
+    return str(model or "").strip().lower().split(":", 1)[0]
+
+
 def _openrouter_requires_reasoning(model: str) -> bool:
-    """Return whether OpenRouter exposes a model as reasoning-mandatory."""
-    model_id = str(model or "").strip().lower().split(":", 1)[0]
-    return model_id == "x-ai/grok-4.5" or model_id == "grok-4.5"
+    """Return whether an earlier rejection showed the model is reasoning-mandatory."""
+    return _openrouter_reasoning_model_key(model) in _OPENROUTER_LEARNED_REASONING_REQUIRED
+
+
+def _drop_rejected_openrouter_reasoning(
+    provider: str, model: str, payload: Dict, status: int, body: str
+) -> bool:
+    """On a "reasoning is mandatory" 400, remember the model and strip the
+    reasoning-off control so the caller can retry once."""
+    if (
+        provider != "openrouter"
+        or status != 400
+        or payload.get("reasoning") != {"effort": "none"}
+        or "reasoning is mandatory" not in str(body or "").lower()
+    ):
+        return False
+    _OPENROUTER_LEARNED_REASONING_REQUIRED.add(_openrouter_reasoning_model_key(model))
+    payload.pop("reasoning", None)
+    logger.warning(
+        "OpenRouter model %s requires reasoning; retrying without the reasoning-off control",
+        model,
+    )
+    return True
+
+
+class _OpenRouterReasoningRetry(Exception):
+    """Leave the rejected stream context before retrying."""
 
 
 def _apply_local_generation_stability(payload: Dict, url: str, model: str) -> None:
@@ -2754,6 +2787,10 @@ async def llm_call_async(
                 note_model_activity(target_url, model)
                 client = _get_http_client()
                 r = await httpx_post_kimi_aware_async(client, target_url, h, json=payload, timeout=call_timeout)
+                if not r.is_success and _drop_rejected_openrouter_reasoning(
+                    provider, model, payload, r.status_code, r.text
+                ):
+                    r = await httpx_post_kimi_aware_async(client, target_url, h, json=payload, timeout=call_timeout)
             duration = time.time() - start
             if not r.is_success:
                 friendly = _format_upstream_error(r.status_code, r.text, target_url)
@@ -2929,7 +2966,8 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                             tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
                             tool_choice_none: bool = False, thinking_mode: Optional[str] = None,
                             reasoning_effort: Optional[str] = None,
-                            _retry_silent_local: bool = True):
+                            _retry_silent_local: bool = True,
+                            _retry_reasoning_mandatory: bool = True):
     """Stream LLM responses with improved error handling.
 
     Yields SSE chunks:
@@ -3453,6 +3491,10 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
             _clear_host_dead(target_url)
             if r.status_code != 200:
                 raw = (await r.aread()).decode(errors="replace")
+                if _retry_reasoning_mandatory and _drop_rejected_openrouter_reasoning(
+                    provider, model, payload, r.status_code, raw
+                ):
+                    raise _OpenRouterReasoningRetry()
                 friendly = _format_upstream_error(r.status_code, raw, target_url)
                 yield f'event: error\ndata: {json.dumps({"status": r.status_code, "text": friendly})}\n\n'
                 return
@@ -3821,6 +3863,26 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                 yield tc_event
             yield "data: [DONE]\n\n"
 
+    except _OpenRouterReasoningRetry:
+        # The model is now learned, so the rebuilt payload omits reasoning-off.
+        async for retry_chunk in _stream_llm_inner(
+            url,
+            model,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            headers=headers,
+            timeout=timeout,
+            prompt_type=prompt_type,
+            tools=tools,
+            session_id=session_id,
+            tool_choice_none=tool_choice_none,
+            thinking_mode=thinking_mode,
+            reasoning_effort=reasoning_effort,
+            _retry_silent_local=_retry_silent_local,
+            _retry_reasoning_mandatory=False,
+        ):
+            yield retry_chunk
     except (httpx.ConnectError, httpx.ConnectTimeout) as e:
         _cooled = _mark_host_dead(target_url)
         _tail = f" — host cooled for {DEAD_HOST_COOLDOWN:.0f}s" if _cooled else " — transient, will retry"

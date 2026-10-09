@@ -1,3 +1,11 @@
+import asyncio
+import contextlib
+import copy
+import json
+
+import httpx
+import pytest
+
 from src import agent_loop, llm_core
 from src.agent_tools import admin_tools
 from src import settings
@@ -29,12 +37,133 @@ def test_openrouter_thinking_off_uses_unified_reasoning_control():
     assert payload["reasoning"] == {"effort": "none"}
 
 
-def test_openrouter_does_not_disable_mandatory_grok_45_reasoning():
-    payload = {"reasoning": {"effort": "none"}}
-    llm_core._apply_hosted_thinking_mode(
-        payload, "openrouter", "x-ai/grok-4.5", "off"
+_OPENROUTER_URL = "https://openrouter.ai/api/v1"
+_MANDATORY_REASONING_BODY = json.dumps({"error": {
+    "message": "Reasoning is mandatory for this endpoint and cannot be disabled.", "code": 400,
+}})
+_TOOLS = [{"type": "function", "function": {"name": "lookup", "parameters": {}}}]
+
+
+@pytest.fixture(autouse=True)
+def _isolated_learned_reasoning_models(monkeypatch):
+    monkeypatch.setattr(llm_core, "_OPENROUTER_LEARNED_REASONING_REQUIRED", set())
+
+
+class _RecordingStreamClient:
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.payloads = []
+
+    @contextlib.asynccontextmanager
+    async def stream(self, method, url, **kwargs):
+        # Copy: production mutates the payload before retrying.
+        self.payloads.append(copy.deepcopy(kwargs["json"]))
+        yield self.responses.pop(0)
+
+
+def _ok_stream(text):
+    chunk = json.dumps({"choices": [{"delta": {"content": text}}]})
+    return httpx.Response(200, text=f"data: {chunk}\n\ndata: [DONE]\n\n")
+
+
+def _run_openrouter_stream(monkeypatch, client, model, thinking_mode, tools=None):
+    """Stream one request and return ``(text, error_payloads)``."""
+    monkeypatch.setattr(llm_core, "_get_http_client", lambda: client)
+    monkeypatch.setattr(llm_core, "_is_host_dead", lambda _url: False)
+
+    async def collect():
+        return [chunk async for chunk in llm_core.stream_llm(
+            _OPENROUTER_URL, model, [{"role": "user", "content": "ping"}],
+            tools=tools, thinking_mode=thinking_mode,
+        )]
+
+    text, errors = "", []
+    for chunk in asyncio.run(collect()):
+        if "data: {" not in chunk:
+            continue
+        data = json.loads(chunk.split("data: ", 1)[1])
+        if chunk.startswith("event: error"):
+            errors.append(data)
+        elif isinstance(data.get("delta"), str):
+            text += data["delta"]
+    return text, errors
+
+
+@pytest.mark.parametrize("tools", [None, _TOOLS], ids=["chat", "agent"])
+def test_openrouter_mandatory_reasoning_stream_self_heals(monkeypatch, tools):
+    client = _RecordingStreamClient(
+        httpx.Response(400, text=_MANDATORY_REASONING_BODY), _ok_stream("pong"),
     )
-    assert "reasoning" not in payload
+
+    result = _run_openrouter_stream(monkeypatch, client, "acme/always-thinks:free", "off", tools)
+
+    assert result == ("pong", [])
+    first, retry = client.payloads
+    assert first["reasoning"] == {"effort": "none"}
+    assert "reasoning" not in retry
+    if tools:
+        assert first["tools"] == retry["tools"] == tools
+
+    # The model is remembered (across variants): later requests skip the control.
+    client = _RecordingStreamClient(_ok_stream("again"))
+    result = _run_openrouter_stream(monkeypatch, client, "acme/always-thinks", "off", tools)
+
+    assert result == ("again", [])
+    assert len(client.payloads) == 1
+    assert "reasoning" not in client.payloads[0]
+
+    other = {}
+    llm_core._apply_hosted_thinking_mode(other, "openrouter", "moonshotai/kimi-k3", "off")
+    assert other["reasoning"] == {"effort": "none"}
+
+
+@pytest.mark.parametrize(("thinking_mode", "tools", "bodies"), [
+    ("off", None, [_MANDATORY_REASONING_BODY, _MANDATORY_REASONING_BODY]),
+    ("off", None, [json.dumps({"error": {"message": "Invalid request", "code": 400}})]),
+    (None, _TOOLS, [_MANDATORY_REASONING_BODY]),
+], ids=["one-shot", "unrelated-400", "agent-default"])
+def test_openrouter_400_surfaced_without_self_heal(monkeypatch, thinking_mode, tools, bodies):
+    model = "acme/rejects"
+    client = _RecordingStreamClient(*(httpx.Response(400, text=body) for body in bodies))
+
+    _, errors = _run_openrouter_stream(monkeypatch, client, model, thinking_mode, tools)
+
+    assert len(client.payloads) == len(bodies)
+    assert [error["status"] for error in errors] == [400]
+    if thinking_mode is None:
+        assert "reasoning" not in client.payloads[0]
+    if len(bodies) == 1:
+        # Nothing was retried, so thinking-off must still be sent next time.
+        payload = {}
+        llm_core._apply_hosted_thinking_mode(payload, "openrouter", model, "off")
+        assert payload["reasoning"] == {"effort": "none"}
+
+
+def test_openrouter_mandatory_reasoning_async_call_self_heals(monkeypatch):
+    sent = []
+    responses = [
+        httpx.Response(400, text=_MANDATORY_REASONING_BODY),
+        httpx.Response(200, json={"choices": [{"message": {"content": "pong"}}]}),
+    ]
+
+    async def fake_post(client, url, headers, **kwargs):
+        sent.append(copy.deepcopy(kwargs["json"]))
+        return responses.pop(0)
+
+    monkeypatch.setattr(llm_core, "_get_http_client", lambda: None)
+    monkeypatch.setattr(llm_core, "httpx_post_kimi_aware_async", fake_post)
+    monkeypatch.setattr(llm_core, "_is_host_dead", lambda _url: False)
+    monkeypatch.setattr(llm_core, "_response_cache", {})
+    monkeypatch.setattr(llm_core, "_response_model_cache", {})
+
+    # max_retries=1: the self-heal must not consume the transport retry budget.
+    result = asyncio.run(llm_core.llm_call_async(
+        _OPENROUTER_URL, "acme/always-thinks", [{"role": "user", "content": "ping"}],
+        max_tokens=0, max_retries=1, thinking_mode="off",
+    ))
+
+    assert result == "pong"
+    assert [payload.get("reasoning") for payload in sent] == [{"effort": "none"}, None]
 
 
 def test_stream_transport_only_keeps_required_protocol_reasoning_when_off():
